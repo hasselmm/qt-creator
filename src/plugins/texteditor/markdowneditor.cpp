@@ -570,12 +570,14 @@ void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
                                       bool /*resolveTarget*/,
                                       bool /*inNextSplit*/)
 {
-    static const auto CAPTURE_GROUP_LINK = u"link";
+    static const auto CAPTURE_GROUP_LINK   = u"link";
     static const auto CAPTURE_GROUP_ANCHOR = u"anchor";
+    static const auto CAPTURE_GROUP_RAWURL = u"rawurl";
 
     static const auto markdownLink = QRegularExpression{
         R"(\[[^[\]]*\]\((?<link>.+?)\))"
         R"(|(?<anchor>\[\^[^\]]+\])(?:[^:]|$))"
+        R"(|(?<rawurl>(?:https?|ftp)\://[^">)\s]+))"
     };
 
     const auto blockOffset = cursor.block().position();
@@ -597,11 +599,13 @@ void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
                     return textDocument()->filePath().parentDir().resolvePath(url.path());
                 else if (url.isLocalFile())
                     return FilePath::fromString(url.toLocalFile());
+                else if (!url.scheme().isEmpty())
+                    return FilePath::fromString(url.toString());
                 else
                     return FilePath{};
             }();
 
-            if (!linkedPath.isFile())
+            if (!linkedPath.isFile() && url.scheme().isEmpty())
                 continue;
 
             auto result = Link{linkedPath};
@@ -625,6 +629,15 @@ void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
             auto result = Link{textDocument()->filePath(), line, column};
             result.linkTextStart = match.capturedStart(CAPTURE_GROUP_ANCHOR) + blockOffset;
             result.linkTextEnd = match.capturedEnd(CAPTURE_GROUP_ANCHOR) + blockOffset;
+            processLinkCallback(std::move(result));
+            break;
+        } else if (const auto rawurl = match.capturedView(CAPTURE_GROUP_RAWURL);
+                   !rawurl.isEmpty()) {
+            // Process raw links starting with "http://", "https://", or "ftp://".
+
+            auto result = Link{FilePath::fromString(rawurl.toString())};
+            result.linkTextStart = match.capturedStart() + blockOffset;
+            result.linkTextEnd = match.capturedEnd() + blockOffset;
             processLinkCallback(std::move(result));
             break;
         } else {
