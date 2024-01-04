@@ -571,7 +571,12 @@ void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
                                       bool /*inNextSplit*/)
 {
     static const auto CAPTURE_GROUP_LINK = u"link";
-    static const auto markdownLink = QRegularExpression{R"(\[[^[\]]*\]\((?<link>.+?)\))"};
+    static const auto CAPTURE_GROUP_ANCHOR = u"anchor";
+
+    static const auto markdownLink = QRegularExpression{
+        R"(\[[^[\]]*\]\((?<link>.+?)\))"
+        R"(|(?<anchor>\[\^[^\]]+\])(?:[^:]|$))"
+    };
 
     const auto blockOffset = cursor.block().position();
     const auto currentBlock = cursor.block().text();
@@ -602,6 +607,24 @@ void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
             auto result = Link{linkedPath};
             result.linkTextStart = match.capturedStart() + blockOffset;
             result.linkTextEnd = match.capturedEnd() + blockOffset;
+            processLinkCallback(std::move(result));
+            break;
+        } else if (const auto anchor = match.capturedView(CAPTURE_GROUP_ANCHOR); !anchor.isEmpty()) {
+            // Process local anchor links of the form `[^footnote]` that point
+            // to anchors in the current document: `[^footnote]: Description`.
+
+            const auto target = cursor.document()->find(anchor + u':');
+
+            if (target.isNull())
+                continue;
+
+            int line = 0;
+            int column = 0;
+
+            convertPosition(target.position(), &line, &column);
+            auto result = Link{textDocument()->filePath(), line, column};
+            result.linkTextStart = match.capturedStart(CAPTURE_GROUP_ANCHOR) + blockOffset;
+            result.linkTextEnd = match.capturedEnd(CAPTURE_GROUP_ANCHOR) + blockOffset;
             processLinkCallback(std::move(result));
             break;
         } else {
