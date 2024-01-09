@@ -54,11 +54,23 @@ const char TOGGLEEDITOR_ACTION[] = "Markdown.ToggleEditor";
 const char TOGGLEPREVIEW_ACTION[] = "Markdown.TogglePreview";
 const char SWAPVIEWS_ACTION[] = "Markdown.SwapViews";
 
+class MarkdownEditorWidget : public TextEditorWidget
+{
+    Q_OBJECT
+public:
+    using TextEditorWidget::TextEditorWidget;
+
+    void findLinkAt(const QTextCursor &cursor,
+                    const Utils::LinkHandler &processLinkCallback,
+                    bool resolveTarget = true,
+                    bool inNextSplit = false) override;
+};
+
 class MarkdownEditor : public IEditor
 {
     Q_OBJECT
 public:
-    MarkdownEditor()
+    MarkdownEditor(const TextEditor::TextEditorActionHandler *actionHandler)
         : m_document(new TextDocument(MARKDOWNVIEWER_ID))
     {
         m_document->setMimeType(MARKDOWNVIEWER_MIME_TYPE);
@@ -92,7 +104,8 @@ public:
         });
 
         // editor
-        m_textEditorWidget = new TextEditorWidget;
+        m_textEditorWidget = new MarkdownEditorWidget;
+        m_textEditorWidget->setOptionalActions(actionHandler->optionalActions());
         m_textEditorWidget->setTextDocument(m_document);
         m_textEditorWidget->setupGenericHighlighter();
         m_textEditorWidget->setMarksVisible(false);
@@ -485,7 +498,7 @@ private:
 MarkdownEditorFactory::MarkdownEditorFactory()
     : m_actionHandler(MARKDOWNVIEWER_ID,
                       MARKDOWNVIEWER_TEXT_CONTEXT,
-                      TextEditor::TextEditorActionHandler::None,
+                      TextEditor::TextEditorActionHandler::FollowSymbolUnderCursor,
                       [](IEditor *editor) {
                           return static_cast<MarkdownEditor *>(editor)->textEditorWidget();
                       })
@@ -493,7 +506,7 @@ MarkdownEditorFactory::MarkdownEditorFactory()
     setId(MARKDOWNVIEWER_ID);
     setDisplayName(::Core::Tr::tr("Markdown Editor"));
     addMimeType(MARKDOWNVIEWER_MIME_TYPE);
-    setEditorCreator([] { return new MarkdownEditor; });
+    setEditorCreator([this] { return new MarkdownEditor{&m_actionHandler}; });
 
     const auto textContext = Context(MARKDOWNVIEWER_TEXT_CONTEXT);
     const auto context = Context(MARKDOWNVIEWER_ID);
@@ -548,6 +561,87 @@ MarkdownEditorFactory::MarkdownEditorFactory()
         if (editor)
             editor->swapViews();
     });
+}
+
+void MarkdownEditorWidget::findLinkAt(const QTextCursor &cursor,
+                                      const LinkHandler &processLinkCallback,
+                                      bool /*resolveTarget*/,
+                                      bool /*inNextSplit*/)
+{
+    static const auto CAPTURE_GROUP_LINK   = u"link";
+    static const auto CAPTURE_GROUP_ANCHOR = u"anchor";
+    static const auto CAPTURE_GROUP_RAWURL = u"rawurl";
+
+    static const auto markdownLink = QRegularExpression{
+        R"(\[[^[\]]*\]\((?<link>.+?)\))"
+        R"(|(?<anchor>\[\^[^\]]+\])(?:[^:]|$))"
+        R"(|(?<rawurl>(?:https?|ftp)\://[^">)\s]+))"
+    };
+
+    const auto blockOffset = cursor.block().position();
+    const auto currentBlock = cursor.block().text();
+
+    for (const auto &match : markdownLink.globalMatchView(currentBlock)) {
+        // Ignore matches outside of the current cursor position.
+        if (cursor.positionInBlock() < match.capturedStart())
+            break;
+        if (cursor.positionInBlock() >= match.capturedEnd())
+            continue;
+
+        if (const auto link = match.capturedView(CAPTURE_GROUP_LINK); !link.isEmpty()) {
+            // Process regular Markdown links of the form `[description](link)`.
+
+            const auto url = QUrl{link.toString()};
+            const auto linkedPath = [this, url] {
+                if (url.isRelative())
+                    return textDocument()->filePath().parentDir().resolvePath(url.path());
+                else if (url.isLocalFile())
+                    return FilePath::fromString(url.toLocalFile());
+                else if (!url.scheme().isEmpty())
+                    return FilePath::fromString(url.toString());
+                else
+                    return FilePath{};
+            }();
+
+            if (!linkedPath.isFile() && url.scheme().isEmpty())
+                continue;
+
+            auto result = Link{linkedPath};
+            result.linkTextStart = match.capturedStart() + blockOffset;
+            result.linkTextEnd = match.capturedEnd() + blockOffset;
+            processLinkCallback(std::move(result));
+            break;
+        } else if (const auto anchor = match.capturedView(CAPTURE_GROUP_ANCHOR); !anchor.isEmpty()) {
+            // Process local anchor links of the form `[^footnote]` that point
+            // to anchors in the current document: `[^footnote]: Description`.
+
+            const auto target = cursor.document()->find(anchor + u':');
+
+            if (target.isNull())
+                continue;
+
+            int line = 0;
+            int column = 0;
+
+            convertPosition(target.position(), &line, &column);
+            auto result = Link{textDocument()->filePath(), line, column};
+            result.linkTextStart = match.capturedStart(CAPTURE_GROUP_ANCHOR) + blockOffset;
+            result.linkTextEnd = match.capturedEnd(CAPTURE_GROUP_ANCHOR) + blockOffset;
+            processLinkCallback(std::move(result));
+            break;
+        } else if (const auto rawurl = match.capturedView(CAPTURE_GROUP_RAWURL);
+                   !rawurl.isEmpty()) {
+            // Process raw links starting with "http://", "https://", or "ftp://".
+
+            auto result = Link{FilePath::fromString(rawurl.toString())};
+            result.linkTextStart = match.capturedStart() + blockOffset;
+            result.linkTextEnd = match.capturedEnd() + blockOffset;
+            processLinkCallback(std::move(result));
+            break;
+        } else {
+            Q_UNREACHABLE();
+        }
+    }
 }
 
 } // namespace TextEditor::Internal
